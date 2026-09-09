@@ -7,6 +7,10 @@ and a Parakeet model. No audio leaves the machine.
 The default model is English only. Point `MODEL_REPO` and `MODEL_FILE` at another
 model for other languages.
 
+An optional second pass sends the finished transcript to a large language model,
+which tidies it and can correct names you supply. It is off unless you configure an
+endpoint and the caller asks for it. See [Postprocessing](#postprocessing).
+
 ## Requirements
 
 - `uv`
@@ -28,14 +32,17 @@ curl --max-time 600 -F file=@audio.opus http://127.0.0.1:8000/transcribe
 ```
 
 ```json
-{"text": "..."}
+{"text": "...", "processed_text": null}
 ```
+
+`text` is always the raw transcript. `processed_text` holds the tidied version, or
+`null` when postprocessing did not run. See [Postprocessing](#postprocessing).
 
 Any format `ffmpeg` can decode is accepted.
 
 | Status | Body | Cause |
 | --- | --- | --- |
-| 200 | `{"text": "..."}` | Success |
+| 200 | `{"text": "...", "processed_text": ...}` | Success |
 | 400 | `{"error": "missing file upload"}` | No `file` field in the form |
 | 400 | `{"error": "empty upload"}` | The uploaded file is empty |
 | 400 | `{"error": "unable to decode audio"}` | `ffmpeg` could not decode it. The reason is in the server log |
@@ -51,6 +58,62 @@ mean writing a gigabyte to disk before rejecting it.
 
 There is no limit on audio length other than the upload size cap.
 
+## Postprocessing
+
+Speech models write a wall of text. They do not punctuate well, they keep every "uh"
+and "um", and they mangle names they have never seen. An optional second pass fixes
+this by sending the finished transcript to a large language model.
+
+The pass is off by default and needs two things to run: the operator sets
+`LLM_BASE_URL` and `LLM_MODEL`, and the caller sends `postprocess=true`.
+
+```bash
+curl --max-time 600 \
+  -F file=@audio.opus \
+  -F postprocess=true \
+  -F 'vocabulary=Stavros,Korokithakis,Harbormaster' \
+  http://127.0.0.1:8000/transcribe
+```
+
+```json
+{"text": "so stavros said uh we should ...", "processed_text": "So Stavros said we should ..."}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `postprocess` | `true` or `1` turns the pass on. Anything else, including leaving it out, turns it off |
+| `vocabulary` | Optional. Words to prefer, separated by commas or newlines. Usually names, jargon, or product names |
+
+The model is told to fix punctuation and capitalisation, break the text into
+paragraphs, drop fillers and false starts, correct obvious mis-transcriptions, and
+prefer your supplied words. It is told not to summarise, reword, or change the
+meaning.
+
+`text` always holds the raw transcript, so nothing you already rely on changes.
+`processed_text` is `null`, and the status is still 200, in all of these cases:
+
+- `postprocess` was not `true` or `1`
+- `LLM_BASE_URL` or `LLM_MODEL` is not set
+- the transcript is empty
+- the transcript is longer than 30000 characters, which is far more than the
+  workload this was built for. The cap exists so that an unexpected multi-hour
+  upload cannot turn into a large bill
+- the language model failed, timed out after 120 seconds, or answered with
+  something unreadable
+
+So a client should use `processed_text` when it is present and fall back to `text`
+when it is `null`. There is no separate error to handle.
+
+**The transcript leaves the machine when you use this.** Audio never does, and
+nothing is sent at all unless a caller asks for the pass. But the endpoint you
+configure receives the full text. If that matters, point `LLM_BASE_URL` at a model
+running on your own hardware. Any server that speaks the OpenAI chat completions
+API works, including Ollama, llama.cpp's server, and LM Studio, as well as the
+hosted providers.
+
+A language model can still ignore its instructions and reword something. Compare
+`processed_text` against `text` if that would be a problem for you.
+
 ## Configuration
 
 All configuration is by environment variable.
@@ -63,6 +126,9 @@ All configuration is by environment variable.
 | `MODEL_REPO` | `handy-computer/parakeet-unified-en-0.6b-gguf` | Hugging Face repository to download the model from |
 | `MODEL_FILE` | `parakeet-unified-en-0.6b-Q5_K_M.gguf` | File to download from that repository |
 | `TRANSCRIBE_MODEL` | unset | Path to a local `.gguf`. If set, it wins and Hugging Face is never contacted |
+| `LLM_BASE_URL` | unset | Base URL of an OpenAI-compatible API, for example `https://api.openai.com/v1`. `/chat/completions` is appended. Unset disables postprocessing |
+| `LLM_MODEL` | unset | Model name sent to that API. Unset disables postprocessing |
+| `LLM_API_KEY` | unset | Sent as `Authorization: Bearer`. Leave unset for a local server that wants no key |
 | `HF_HOME` | `~/.cache/huggingface` | Where the downloaded model is cached. Read by `huggingface_hub`, not by this server |
 | `TMPDIR` | `/tmp` | Where uploads are staged before decoding. Read by Python, not by this server |
 
@@ -101,9 +167,12 @@ docker compose up --build --detach
 | --- | --- | --- |
 | `PUBLISH_ADDR` | `127.0.0.1:8000` | Host address and port to publish. Read by Compose, not by the server |
 
-`IDLE_TIMEOUT`, `MODEL_REPO` and `MODEL_FILE` are passed through to the container if
-you set them. The rest of the Configuration table is fixed by the image and the port
-mapping.
+`IDLE_TIMEOUT`, `MODEL_REPO`, `MODEL_FILE`, `LLM_BASE_URL`, `LLM_MODEL` and
+`LLM_API_KEY` are passed through to the container if you set them. The rest of the
+Configuration table is fixed by the image and the port mapping.
+
+A local language model on the host is not reachable at `127.0.0.1` from inside the
+container. Use the host address that your Docker setup provides.
 
 ## Harbormaster
 
@@ -135,6 +204,9 @@ Speed depends heavily on the CPU. On a 2 core 15 W laptop chip, an Intel i3-8109
 transcription runs at roughly 2.8x realtime: about 40 seconds for a 2 minute file and
 about 3.5 minutes for a 10 minute file. A modern many core desktop CPU is several
 times faster. Measure your own hardware before relying on a number.
+
+Postprocessing adds the language model's own response time on top, which is seconds
+for a hosted API and much longer for a local model on a slow machine.
 
 Set client timeouts to suit. If you put a reverse proxy in front, raise its read
 timeout too, since the defaults are usually 60 seconds. nginx needs
