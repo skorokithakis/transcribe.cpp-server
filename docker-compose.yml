@@ -1,0 +1,21 @@
+services:
+  main:
+    build: .
+    restart: unless-stopped
+    # The server has no authentication, so it is published on the loopback
+    # interface only. Set PUBLISH_ADDR to expose it somewhere else.
+    ports:
+      - "${PUBLISH_ADDR:-127.0.0.1:8000}:8000"
+    # Listed without values, so an unset variable is omitted and the defaults
+    # in transcribe.py apply.
+    environment:
+      - IDLE_TIMEOUT
+      - MODEL_REPO
+      - MODEL_FILE
+    volumes:
+      - cache-models:/models
+
+volumes:
+  # HF_HOME is /models in the image. The name starts with "cache-" because the
+  # model is a reproducible download, so Harbormaster keeps it under caches/.
+  cache-models:

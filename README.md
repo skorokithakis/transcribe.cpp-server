@@ -88,6 +88,47 @@ the model is downloaded again on every new container. Python dependencies are
 installed at build time, so the first request does not wait for them. The image is
 about 1.03 GB and does not contain the model.
 
+## Compose
+
+`docker-compose.yml` builds the image, mounts a `cache-models` volume at `/models`,
+and publishes the port on the loopback interface.
+
+```bash
+docker compose up --build --detach
+```
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `PUBLISH_ADDR` | `127.0.0.1:8000` | Host address and port to publish. Read by Compose, not by the server |
+
+`IDLE_TIMEOUT`, `MODEL_REPO` and `MODEL_FILE` are passed through to the container if
+you set them. The rest of the Configuration table is fixed by the image and the port
+mapping.
+
+## Harbormaster
+
+[Harbormaster](https://harbormaster.readthedocs.io/) finds `docker-compose.yml` on its
+own, so an app stanza is all you need:
+
+```yaml
+apps:
+  transcribe:
+    url: https://github.com/skorokithakis/transcribe.cpp-server.git
+    manage_volumes: true
+    environment:
+      PUBLISH_ADDR: "127.0.0.1:8000"
+```
+
+`manage_volumes: true` backs the model with a plain host directory at
+`caches/transcribe/cache-models`. The volume name starts with `cache-`, so Harbormaster
+treats the model as throwaway and deletes the directory if you remove the app from the
+config. The next start downloads the model again, and the port stays closed until that
+finishes. The branch defaults to `master`, which is the branch this repository uses.
+
+Harbormaster provides no reverse proxy, TLS or authentication, and neither does this
+server, so the default publishes on loopback only. Widen `PUBLISH_ADDR` only behind
+something that authenticates.
+
 ## Notes
 
 Speed depends heavily on the CPU. On a 2 core 15 W laptop chip, an Intel i3-8109U,
