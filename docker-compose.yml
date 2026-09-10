@@ -10,6 +10,9 @@ services:
     # in transcribe.py apply.
     environment:
       - IDLE_TIMEOUT
+      - CLOUD_BASE_URL
+      - CLOUD_MODEL
+      - CLOUD_API_KEY
       - LLM_BASE_URL
       - LLM_MODEL
       - LLM_API_KEY
