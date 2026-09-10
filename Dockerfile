@@ -20,4 +20,5 @@ ENV HF_HOME=/models
 VOLUME ["/models"]
 EXPOSE 8000
 
-CMD ["uv", "run", "--offline", "--script", "transcribe.py"]
+# Lower priority keeps the host responsive during transcription.
+CMD ["nice", "-n", "19", "uv", "run", "--offline", "--script", "transcribe.py"]
