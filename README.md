@@ -144,9 +144,11 @@ Note that `vocabulary` now does something on its own. Previously it was ignored 
   contains either.
 - The local engine cannot do this at all, so `vocabulary` still only affects
   postprocessing there.
-- Biasing needs a model that supports it. The default `gpt-transcribe` does.
-  `whisper-1` does not, so with `CLOUD_MODEL=whisper-1` any request carrying a
-  `vocabulary` fails with a 502.
+- Biasing needs a model that supports it, and the default `gpt-transcribe` is the only
+  OpenAI transcription model that currently does. `whisper-1`, `gpt-4o-transcribe` and
+  `gpt-4o-mini-transcribe` all reject the request outright, so pointing `CLOUD_MODEL` at
+  one of those makes every request carrying a `vocabulary` fail with a 502. Leave
+  `CLOUD_MODEL` alone unless you do not need biasing.
 - If you also send `postprocess=true`, the same words are used twice: once while
   transcribing and once while tidying up. That is intended.
 
