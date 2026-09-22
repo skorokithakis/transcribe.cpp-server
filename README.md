@@ -193,19 +193,21 @@ prefer your supplied words. It is told not to summarise, reword, or change the
 meaning.
 
 `text` always holds the raw transcript, so nothing you already rely on changes.
-`processed_text` is `null`, and the status is still 200, in all of these cases:
+If `postprocess` was not `true` or `1`, `processed_text` is `null`.
 
-- `postprocess` was not `true` or `1`
+If you asked for the pass, `processed_text` is always a string. It holds the raw
+transcript, the same as `text`, and the status is still 200, in all of these cases:
+
 - `LLM_BASE_URL` or `LLM_MODEL` is not set
 - the transcript is empty
 - the transcript is longer than 30000 characters, which is far more than the
   workload this was built for. The cap exists so that an unexpected multi-hour
   upload cannot turn into a large bill
-- the language model failed, timed out after 120 seconds, or answered with
-  something unreadable
+- the language model failed, was rate-limited, timed out after 120 seconds, or
+  answered with something unreadable
 
-So a client should use `processed_text` when it is present and fall back to `text`
-when it is `null`. There is no separate error to handle.
+So a client that asked for the pass can always use `processed_text`. There is no
+separate error to handle. The server logs the reason when the pass fails.
 
 **The transcript leaves the machine when you use this.** Nothing is sent at all unless
 a caller asks for the pass, and with the local engine the audio itself never leaves. But

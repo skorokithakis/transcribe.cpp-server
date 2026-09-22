@@ -274,9 +274,11 @@ def transcribe():
                 return jsonify(error="unable to decode audio"), 400
             engine = "local"
 
+        # When the caller asked for the pass, processed_text is never null: a failed or
+        # skipped pass returns the raw transcript, so clients need no fallback of their own.
         processed_text = None
         if request.form.get("postprocess") in ("true", "1"):
-            processed_text = postprocess_transcript(text, request.form.get("vocabulary", ""))
+            processed_text = postprocess_transcript(text, request.form.get("vocabulary", "")) or text
         return jsonify(text=text, processed_text=processed_text, engine=engine)
     finally:
         if path is not None:
