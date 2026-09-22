@@ -5,8 +5,9 @@ An HTTP server that transcribes an uploaded audio file and returns the text as J
 By default, speech recognition runs locally with
 [transcribe.cpp](https://pypi.org/project/transcribe-cpp/) and a Parakeet model, and no
 audio leaves the machine. The operator can instead point the server at OpenAI, and then
-every request is transcribed there. One engine or the other handles everything; there is
-no fallback and the caller cannot choose. See [Cloud engine](#cloud-engine).
+every request is transcribed there. If the cloud is down or rate limited, the request
+falls back to the local engine. The caller cannot choose which engine runs. See
+[Cloud engine](#cloud-engine).
 
 The default local model is English only. Point `MODEL_REPO` and `MODEL_FILE` at another
 model for other languages.
@@ -27,8 +28,8 @@ endpoint and the caller asks for it. See [Postprocessing](#postprocessing).
 ```
 
 The server listens on `127.0.0.1:8000`. On first start it downloads the model, about
-541 MB, and does not open the port until the download finishes. With the
-[cloud engine](#cloud-engine) there is no model, so it starts at once.
+541 MB, and does not open the port until the download finishes. This happens in both
+modes, because the [cloud engine](#cloud-engine) uses the local model as a fallback.
 
 ## Use
 
@@ -56,7 +57,7 @@ Any format `ffmpeg` can decode is accepted.
 | 413 | `{"error": "upload exceeds 100 MB"}` | Upload over the size limit |
 | 413 | `{"error": "audio too long for the cloud engine"}` | Cloud engine only. Still over 25 MB after re-encoding. See [Cloud engine](#cloud-engine) |
 | 500 | `{"error": "internal server error"}` | Unexpected failure. The traceback is in the server log |
-| 502 | `{"error": "transcription failed"}` | Cloud engine only. The API was unreachable, refused the request, or answered with something unreadable. The reason is in the server log |
+| 502 | `{"error": "transcription failed"}` | Cloud engine only. The API refused the request (4xx other than 429), the request timed out, or the answer was unreadable. The reason is in the server log. 429, 5xx and connection failures fall back to the local engine instead |
 
 Other errors, such as 404 for an unknown path and 405 for the wrong method, also
 return a JSON body.
@@ -85,14 +86,22 @@ export CLOUD_API_KEY=sk-your-key-here
 choice belongs to the operator and is deliberately not exposed to callers, so:
 
 - It applies to *every* request. A caller cannot ask for it and cannot opt out of it.
-- There is no fallback in either direction. If the API fails, the request fails with a
-  502. The local model is not used as a backstop.
+- If the API answers with 429 or a 5xx, or the connection fails, the request is
+  transcribed locally instead and the response has `engine` set to `local`. The audio
+  then goes nowhere new, so the operator's choice of where audio goes still holds.
+- Any other failure, such as a 4xx, a timeout, or an unreadable answer, still fails with
+  a 502. There is no local-to-cloud fallback.
 - The `engine` field in each response says which recogniser ran, so a caller can at
   least tell where its audio went.
 
-In cloud mode no local model is downloaded or loaded, so the server starts at once and
-needs no model volume. `MODEL_REPO`, `MODEL_FILE`, `TRANSCRIBE_MODEL` and `IDLE_TIMEOUT`
-have no effect. `ffmpeg` is still needed.
+Because of the fallback, cloud mode still downloads the local model at startup. The server
+does not open the port until the download finishes, and it needs the same model volume
+as a local run. The model is loaded into memory only when a request falls back, and
+`IDLE_TIMEOUT` frees it again. `MODEL_REPO`, `MODEL_FILE`, `TRANSCRIBE_MODEL` and
+`IDLE_TIMEOUT` therefore apply in cloud mode too. `ffmpeg` is needed in both modes.
+
+A fallback loses vocabulary biasing. Local runs are serialized, so during a cloud outage
+requests queue behind each other.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
@@ -142,8 +151,8 @@ Note that `vocabulary` now does something on its own. Previously it was ignored 
   nobody said.
 - `<` and `>` are removed from each word. The API rejects the whole request if a keyword
   contains either.
-- The local engine cannot do this at all, so `vocabulary` still only affects
-  postprocessing there.
+- The local engine cannot do this at all, so when a request falls back to it (or you
+  run without `CLOUD_API_KEY`), `vocabulary` only affects postprocessing.
 - Biasing needs a model that supports it, and the default `gpt-transcribe` is the only
   OpenAI transcription model that currently does. `whisper-1`, `gpt-4o-transcribe` and
   `gpt-4o-mini-transcribe` all reject the request outright, so pointing `CLOUD_MODEL` at
@@ -224,10 +233,10 @@ All configuration is by environment variable.
 | `CLOUD_API_KEY` | unset | Set it to transcribe every request with the cloud engine instead of locally. See [Cloud engine](#cloud-engine) |
 | `CLOUD_BASE_URL` | `https://api.openai.com/v1` | Base URL of an OpenAI-compatible API. `/audio/transcriptions` is appended |
 | `CLOUD_MODEL` | `gpt-transcribe` | Transcription model name sent to that API |
-| `IDLE_TIMEOUT` | `300` | Seconds of inactivity before the model is freed from memory. `0` keeps it loaded forever. Checked every 30 seconds, so the unload can be up to 30 seconds late. Local engine only |
-| `MODEL_REPO` | `handy-computer/parakeet-unified-en-0.6b-gguf` | Hugging Face repository to download the model from. Local engine only |
-| `MODEL_FILE` | `parakeet-unified-en-0.6b-Q5_K_M.gguf` | File to download from that repository. Local engine only |
-| `TRANSCRIBE_MODEL` | unset | Path to a local `.gguf`. If set, it wins and Hugging Face is never contacted. Local engine only |
+| `IDLE_TIMEOUT` | `300` | Seconds of inactivity before the model is freed from memory. `0` keeps it loaded forever. Checked every 30 seconds, so the unload can be up to 30 seconds late |
+| `MODEL_REPO` | `handy-computer/parakeet-unified-en-0.6b-gguf` | Hugging Face repository to download the model from |
+| `MODEL_FILE` | `parakeet-unified-en-0.6b-Q5_K_M.gguf` | File to download from that repository |
+| `TRANSCRIBE_MODEL` | unset | Path to a local `.gguf`. If set, it wins and Hugging Face is never contacted |
 | `LLM_BASE_URL` | unset | Base URL of an OpenAI-compatible API, for example `https://api.openai.com/v1`. `/chat/completions` is appended. Unset disables postprocessing |
 | `LLM_MODEL` | unset | Model name sent to that API. Unset disables postprocessing |
 | `LLM_API_KEY` | unset | Sent as `Authorization: Bearer`. Leave unset for a local server that wants no key |
@@ -237,8 +246,8 @@ All configuration is by environment variable.
 The default bind address is `127.0.0.1` because the server has no authentication.
 Exposing it on a network is a deliberate act, so set `HOST` yourself.
 
-The rest of this section describes the local engine. With `CLOUD_API_KEY` set, no model
-is downloaded and none of it applies.
+The rest of this section describes the local engine, which also runs as the cloud
+fallback.
 
 The model is downloaded once and cached. Later starts reuse the cached copy and
 download again only if it is missing. To skip the cache validation request to
@@ -254,11 +263,11 @@ docker build -t transcribe .
 docker run -d -p 8000:8000 -v transcribe-models:/models transcribe
 ```
 
-The image sets `HOST=0.0.0.0` and `HF_HOME=/models`. With the local engine, mount a
-volume at `/models` or the model is downloaded again on every new container. The cloud
-engine downloads nothing, so it needs no volume. Python dependencies are
-installed at build time, so the first request does not wait for them. The image is
-about 1.03 GB and does not contain the model.
+The image sets `HOST=0.0.0.0` and `HF_HOME=/models`. Mount a volume at `/models` or the
+model is downloaded again on every new container. This applies in both modes, since the
+cloud engine downloads the local model for the fallback. Python dependencies are installed at
+build time, so the first request does not wait for them. The image is about 1.03 GB and
+does not contain the model.
 
 ## Compose
 
@@ -278,9 +287,8 @@ docker compose up --build --detach
 container if you set them. The rest of the Configuration table is fixed by the image and
 the port mapping.
 
-With `CLOUD_API_KEY` set, no model is downloaded, so the `cache-models` volume is never
-read or written. Leaving it mounted costs nothing, and anything an earlier local run put
-there stays untouched.
+The `cache-models` volume is used in both modes, because the cloud engine still downloads
+the local model for its fallback.
 
 A local language model on the host is not reachable at `127.0.0.1` from inside the
 container. Use the host address that your Docker setup provides.
@@ -303,8 +311,8 @@ apps:
 `caches/transcribe/cache-models`. The volume name starts with `cache-`, so Harbormaster
 treats the model as throwaway and deletes the directory if you remove the app from the
 config. The next start downloads the model again, and the port stays closed until that
-finishes, unless the cloud engine is configured, in which case there is no model to
-download. The branch defaults to `master`, which is the branch this repository uses.
+finishes, in both modes. The branch defaults to `master`, which is the branch this
+repository uses.
 
 Harbormaster provides no reverse proxy, TLS or authentication, and neither does this
 server, so the default publishes on loopback only. Widen `PUBLISH_ADDR` only behind
@@ -317,8 +325,8 @@ an Intel i3-8109U, transcription runs at roughly 2.8x realtime: about 40 seconds
 2 minute file and about 3.5 minutes for a 10 minute file. A modern many core desktop CPU
 is several times faster. Measure your own hardware before relying on a number.
 
-With the cloud engine none of that applies. The wait is the upload plus the API's own
-response time, so the local CPU barely matters.
+With the cloud engine the wait is the upload plus the API's own response time, so the
+local CPU barely matters, except when a request falls back to the local engine.
 
 Postprocessing adds the language model's own response time on top, which is seconds
 for a hosted API and much longer for a local model on a slow machine.
@@ -341,7 +349,8 @@ are queued rather than run in parallel. A caller can therefore wait for every re
 ahead of it.
 
 The cloud engine has no such limit, since the work happens elsewhere. Requests run
-concurrently, up to however many threads waitress is running.
+concurrently, up to however many threads waitress is running, until one falls back to the
+local engine, which is serialized like any other local run.
 
 There is no authentication and no rate limiting. Do not expose it to an untrusted
 network.
