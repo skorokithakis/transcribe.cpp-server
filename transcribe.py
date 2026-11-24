@@ -20,7 +20,16 @@ from werkzeug.exceptions import HTTPException, RequestEntityTooLarge
 # All whitespace is removed, not just the ends. A key is never legitimately allowed to
 # contain any, and an embedded newline would make the HTTP client reject the header with
 # an error that quotes the value back, which would put the key in the log.
-CLOUD_API_KEY = "".join(os.environ.get("CLOUD_API_KEY", "").split())
+SONIOX_API_KEY = "".join(os.environ.get("SONIOX_API_KEY", "").split())
+SONIOX_BASE_URL = "https://api.soniox.com/v1"
+# Fixed because the async API is what the request flow below is built around, and because
+# a per-deployment model setting would only ever be a source of version drift.
+SONIOX_MODEL = "stt-async-v6"
+# Soniox accepts these as they are. Anything else is re-encoded to MP3, which Soniox
+# also accepts, rather than sent and rejected.
+CLOUD_UPLOAD_EXTENSIONS = frozenset({
+    "aac", "aiff", "amr", "asf", "flac", "mp3", "ogg", "opus", "wav", "webm", "m4a", "mp4",
+})
 
 # The local model is set up in both modes. In cloud mode it is the fallback for a
 # cloud outage, so even there the download runs at startup.
@@ -39,10 +48,16 @@ last_used = 0.0
 MAX_UPLOAD_BYTES = 100 * 1024 * 1024
 LLM_TIMEOUT_SECONDS = 120
 CLOUD_TIMEOUT_SECONDS = 300
-MAX_CLOUD_AUDIO_BYTES = 25 * 1024 * 1024
+# Cleanup runs after the cloud deadline has passed, so it needs a budget of its own.
+CLOUD_CLEANUP_TIMEOUT_SECONDS = 10
 MAX_KEYWORDS = 100
 # This prevents a multi-hour upload from unexpectedly becoming an expensive LLM request.
 MAX_POSTPROCESS_CHARACTERS = 30_000
+
+
+class CloudTranscriptionError(Exception):
+    """A cloud failure that must not fall back to the local engine."""
+
 
 POSTPROCESS_PROMPT = """You are editing a speech transcript. Return the corrected transcript and nothing else.
 
@@ -117,6 +132,44 @@ def vocabulary_words(vocabulary):
     return [word for word in words if word][:MAX_KEYWORDS]
 
 
+def remaining_cloud_seconds(deadline):
+    """Return the seconds left before the cloud deadline, or fail if it has passed."""
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise CloudTranscriptionError(
+            f"cloud transcription exceeded {CLOUD_TIMEOUT_SECONDS} seconds"
+        )
+    return remaining
+
+
+def delete_cloud_resources(file_id, transcription_id):
+    """Delete the uploaded audio and its transcription, best effort.
+
+    The file goes first. Soniox refuses to delete a transcription that is still
+    processing, and deleting the file makes the running job fail, so the transcription
+    can only be removed afterwards. The broad catch is deliberate: this is a privacy
+    control, because Soniox otherwise keeps uploaded audio for 30 days, and a cleanup
+    failure must never change what the caller gets back.
+    """
+    resources = []
+    if file_id is not None:
+        resources.append(("file", f"{SONIOX_BASE_URL}/files/{file_id}"))
+    if transcription_id is not None:
+        resources.append(("transcription", f"{SONIOX_BASE_URL}/transcriptions/{transcription_id}"))
+    headers = {"Authorization": f"Bearer {SONIOX_API_KEY}"}
+    for label, url in resources:
+        try:
+            response = httpx.delete(url, headers=headers, timeout=CLOUD_CLEANUP_TIMEOUT_SECONDS)
+            response.raise_for_status()
+        except Exception as error:
+            app.logger.warning(
+                "Failed to delete Soniox %s (%s): %s",
+                label,
+                type(error).__name__,
+                str(error).replace(SONIOX_API_KEY, "<redacted>"),
+            )
+
+
 def postprocess_transcript(transcript, vocabulary):
     base_url = os.environ.get("LLM_BASE_URL")
     llm_model = os.environ.get("LLM_MODEL")
@@ -185,13 +238,10 @@ def transcribe():
             if size == 0:
                 return jsonify(error="empty upload"), 400
 
-        if CLOUD_API_KEY:
+        if SONIOX_API_KEY:
             filename = upload.filename or ""
             extension = filename.rsplit(".", 1)[1].lower() if "." in filename else ""
-            if (
-                extension in ("mp3", "mp4", "mpeg", "mpga", "m4a", "webm")
-                and size < MAX_CLOUD_AUDIO_BYTES
-            ):
+            if extension in CLOUD_UPLOAD_EXTENSIONS:
                 with open(path, "rb") as audio_file:
                     audio = audio_file.read()
             else:
@@ -209,25 +259,65 @@ def transcribe():
                     )
                     return jsonify(error="unable to decode audio"), 400
 
-            if len(audio) > MAX_CLOUD_AUDIO_BYTES:
-                return jsonify(error="audio too long for the cloud engine"), 413
-
+            headers = {"Authorization": f"Bearer {SONIOX_API_KEY}"}
+            file_id = None
+            transcription_id = None
             response_body = ""
             fallback = False
+            # Upload, polling and the transcript fetch share one deadline. Cleanup is
+            # deliberately outside it, since it must run even when the deadline is gone.
+            deadline = time.monotonic() + CLOUD_TIMEOUT_SECONDS
             try:
                 words = vocabulary_words(request.form.get("vocabulary", ""))
-                data = {"model": os.environ.get("CLOUD_MODEL", "gpt-transcribe")}
-                if words:
-                    data["keywords[]"] = words
-                cloud_base_url = os.environ.get("CLOUD_BASE_URL", "https://api.openai.com/v1").rstrip("/")
                 response = httpx.post(
-                    f"{cloud_base_url}/audio/transcriptions",
+                    f"{SONIOX_BASE_URL}/files",
                     files={"file": (f"audio.{extension}", audio, "application/octet-stream")},
-                    data=data,
-                    headers={
-                        "Authorization": f"Bearer {CLOUD_API_KEY}",
-                    },
-                    timeout=CLOUD_TIMEOUT_SECONDS,
+                    headers=headers,
+                    timeout=remaining_cloud_seconds(deadline),
+                )
+                response_body = response.text
+                response.raise_for_status()
+                file_id = response.json()["id"]
+
+                data = {"model": SONIOX_MODEL, "file_id": file_id}
+                if words:
+                    data["context"] = {"terms": words}
+                response = httpx.post(
+                    f"{SONIOX_BASE_URL}/transcriptions",
+                    json=data,
+                    headers=headers,
+                    timeout=remaining_cloud_seconds(deadline),
+                )
+                response_body = response.text
+                response.raise_for_status()
+                transcription_id = response.json()["id"]
+
+                while True:
+                    response = httpx.get(
+                        f"{SONIOX_BASE_URL}/transcriptions/{transcription_id}",
+                        headers=headers,
+                        timeout=remaining_cloud_seconds(deadline),
+                    )
+                    response_body = response.text
+                    response.raise_for_status()
+                    job = response.json()
+                    status = job.get("status")
+                    if status == "completed":
+                        break
+                    if status == "error":
+                        raise CloudTranscriptionError(
+                            "Soniox job failed (error_type={!r}): {}".format(
+                                job.get("error_type"), job.get("error_message")
+                            )
+                        )
+                    if status not in ("queued", "processing"):
+                        raise ValueError(f"unreadable Soniox job status {status!r}")
+                    time.sleep(min(1, remaining_cloud_seconds(deadline)))
+
+                response = httpx.get(
+                    f"{SONIOX_BASE_URL}/transcriptions/{transcription_id}/transcript",
+                    headers=headers,
+                    timeout=remaining_cloud_seconds(deadline),
                 )
                 response_body = response.text
                 response.raise_for_status()
@@ -247,8 +337,8 @@ def transcribe():
                     isinstance(error, httpx.TransportError)
                     and not isinstance(error, httpx.TimeoutException)
                 )
-                redacted_error = str(error).replace(CLOUD_API_KEY, "<redacted>")
-                redacted_body = response_body.replace(CLOUD_API_KEY, "<redacted>")
+                redacted_error = str(error).replace(SONIOX_API_KEY, "<redacted>")
+                redacted_body = response_body.replace(SONIOX_API_KEY, "<redacted>")
                 if fallback:
                     app.logger.warning(
                         "Cloud transcription failed (%s): %s; response body: %s; falling back to local",
@@ -262,6 +352,10 @@ def transcribe():
                     return jsonify(error="transcription failed"), 502
             else:
                 engine = "cloud"
+            finally:
+                # Runs before a fallback so the audio does not stay on Soniox while the
+                # local engine works through a backlog.
+                delete_cloud_resources(file_id, transcription_id)
 
             if fallback:
                 text = transcribe_locally(path)
